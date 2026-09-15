@@ -70,6 +70,14 @@ pub fn build(b: *std.Build) !void {
 
     const check = setupCheckStep(b, target, optimize, options, superhtml, folders, lsp);
     const test_step = setupTestStep(b, superhtml, check);
+    const build_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(build_tests).step);
     setupCliTool(b, target, optimize, options, superhtml, folders, lsp);
     setupWasmStep(b, optimize, options, superhtml, lsp);
     setupFetchLanguageSubtagRegistryStep(b, target);
@@ -429,6 +437,8 @@ const Version = union(Kind) {
 };
 
 fn getGitVersion(b: *std.Build) Version {
+    // A fetched package must not discover the consumer's enclosing repository.
+    b.root.root_dir.handle.access(b.graph.io, ".git", .{}) catch return .unknown;
     const git_path = b.findProgram(.{ .names = &.{"git"} }) orelse return .unknown;
     var out: u8 = undefined;
     const git_describe = std.mem.trim(
@@ -437,39 +447,45 @@ fn getGitVersion(b: *std.Build) Version {
             git_path,               "-C",
             b.root.root_dir.path.?, "describe",
             "--match",              "*.*.*",
-            "--tags",
+            "--tags",               "--long",
         }, &out, .ignore) catch return .unknown,
         " \n\r",
     );
 
-    switch (std.mem.count(u8, git_describe, "-")) {
-        0 => return .{ .tag = git_describe },
-        2 => {
-            // Untagged development build (e.g. 0.8.0-684-gbbe2cca1a).
-            var it = std.mem.splitScalar(u8, git_describe, '-');
-            const tagged_ancestor = it.next() orelse unreachable;
-            const commit_height = it.next() orelse unreachable;
-            const commit_id = it.next() orelse unreachable;
+    return parseGitDescribe(b.allocator, git_describe) catch .unknown;
+}
 
-            // Check that the commit hash is prefixed with a 'g'
-            // (it's a Git convention)
-            if (commit_id.len < 1 or commit_id[0] != 'g') {
-                std.debug.panic("Unexpected `git describe` output: {s}\n", .{git_describe});
-            }
+fn parseGitDescribe(allocator: std.mem.Allocator, description: []const u8) !Version {
+    // --long always appends -<distance>-g<hash>, even for an exact tag.
+    var parts = std.mem.splitBackwardsScalar(u8, description, '-');
+    const commit_id = parts.next() orelse return .unknown;
+    const distance = parts.next() orelse return .unknown;
+    const tag = parts.rest();
+    if (tag.len == 0 or commit_id.len < 2 or commit_id[0] != 'g') return .unknown;
+    const height = std.fmt.parseInt(usize, distance, 10) catch return .unknown;
+    if (height == 0) return .{ .tag = tag };
+    return .{ .commit = try std.fmt.allocPrint(allocator, "{s}-dev.{s}+{s}", .{
+        tag, distance, commit_id[1..],
+    }) };
+}
 
-            // The version is reformatted in accordance with
-            // the https://semver.org specification.
-            return .{
-                .commit = b.fmt("{s}-dev.{s}+{s}", .{
-                    tagged_ancestor,
-                    commit_height,
-                    commit_id[1..],
-                }),
-            };
-        },
-        else => std.debug.panic(
-            "Unexpected `git describe` output: {s}\n",
-            .{git_describe},
-        ),
+test "git describe preserves hyphenated tags" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "v0.7.0", "v0.9.1-cooties", "v0.9.1-cooties-rc.1" }) |tag| {
+        const exact = try std.fmt.allocPrint(allocator, "{s}-0-gabcdef", .{tag});
+        defer allocator.free(exact);
+        const version = try parseGitDescribe(allocator, exact);
+        try std.testing.expect(version == .tag);
+        try std.testing.expectEqualStrings(tag, version.tag);
+
+        const later = try std.fmt.allocPrint(allocator, "{s}-12-gabcdef", .{tag});
+        defer allocator.free(later);
+        const development = try parseGitDescribe(allocator, later);
+        try std.testing.expect(development == .commit);
+        defer allocator.free(development.commit);
+        const expected = try std.fmt.allocPrint(allocator, "{s}-dev.12+abcdef", .{tag});
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, development.commit);
     }
+    try std.testing.expect(try parseGitDescribe(allocator, "unknown") == .unknown);
 }
